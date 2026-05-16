@@ -14,11 +14,13 @@ import faiss
 
 DATA_DIR = Path("data")
 ML100K_URL = "https://files.grouplens.org/datasets/movielens/ml-100k.zip"
+BOLLYWOOD_CSV = DATA_DIR / "bollywood_movies.csv"
 
 # ── Data ────────────────────────────────────────────────────────────────────
 
-@st.cache_data(show_spinner="Downloading MovieLens 100K...")
+@st.cache_data(show_spinner="Loading movie catalog...")
 def load_data():
+    # MovieLens 100K
     if not (DATA_DIR / "ml-100k").exists():
         r = requests.get(ML100K_URL)
         with zipfile.ZipFile(BytesIO(r.content)) as z:
@@ -35,15 +37,27 @@ def load_data():
         "Film-Noir", "Horror", "Musical", "Mystery", "Romance",
         "Sci-Fi", "Thriller", "War", "Western"
     ]
-    movies = pd.read_csv(
+    hollywood = pd.read_csv(
         DATA_DIR / "ml-100k" / "u.item",
         sep="|", encoding="latin-1",
         names=["item_id", "title", "release_date", "video_release_date", "imdb_url"] + genre_cols
     )
-    movies["genres_text"] = movies[genre_cols].apply(
+    hollywood["genres_text"] = hollywood[genre_cols].apply(
         lambda row: " ".join(g for g, v in zip(genre_cols, row) if v == 1), axis=1
     )
-    movies["description"] = movies["title"] + " | " + movies["genres_text"]
+    hollywood["description"] = hollywood["title"] + " | " + hollywood["genres_text"]
+    hollywood["source"] = "Hollywood"
+
+    movies = hollywood[["item_id", "title", "genres_text", "description", "source"]]
+
+    # Merge Bollywood if fetched
+    if BOLLYWOOD_CSV.exists():
+        bollywood = pd.read_csv(BOLLYWOOD_CSV)[
+            ["item_id", "title", "genres_text", "description", "source"]
+        ]
+        bollywood["source"] = "Bollywood"
+        movies = pd.concat([movies, bollywood], ignore_index=True).drop_duplicates("item_id")
+
     return ratings, movies
 
 
@@ -96,31 +110,43 @@ def build_semantic(_movies):
 
 # ── Recommender logic ────────────────────────────────────────────────────────
 
-def recommend(user_id, query, alpha, n, ratings, movies, R_pred, user_idx, item_idx, encoder, faiss_index, idx_to_item_id):
-    user_rated = ratings[ratings.user_id == user_id]["item_id"].tolist()
-    all_ids = set(movies["item_id"])
-    candidates = list(all_ids - set(user_rated))
+def recommend(user_id, query, alpha, n, catalog_filter,
+              ratings, movies, R_pred, user_idx, item_idx,
+              encoder, faiss_index, idx_to_item_id):
+
+    filtered = movies if catalog_filter == "All" else movies[movies["source"] == catalog_filter]
+    user_rated = set(ratings[ratings.user_id == user_id]["item_id"].tolist())
+    candidates = list(set(filtered["item_id"]) - user_rated)
 
     uid = user_idx.get(user_id)
     if uid is not None:
         raw = {mid: float(R_pred[uid, item_idx[mid]]) for mid in candidates if mid in item_idx}
-        mn, mx = min(raw.values()), max(raw.values())
-        cf = {mid: (r - mn) / (mx - mn or 1) for mid, r in raw.items()}
+        if raw:
+            mn, mx = min(raw.values()), max(raw.values())
+            cf = {mid: (r - mn) / (mx - mn or 1) for mid, r in raw.items()}
+        else:
+            cf = {}
+        # Bollywood movies have no CF signal — give them user mean (neutral 0.5)
+        cf.update({mid: 0.5 for mid in candidates if mid not in cf})
     else:
         cf = {mid: 0.5 for mid in candidates}
 
     if query.strip():
         q_vec = encoder.encode([query], normalize_embeddings=True).astype(np.float32)
-        sims, idxs = faiss_index.search(q_vec, min(300, faiss_index.ntotal))
+        sims, idxs = faiss_index.search(q_vec, min(500, faiss_index.ntotal))
+        candidate_set = set(candidates)
         sem = {idx_to_item_id[idx]: float((sim + 1) / 2)
                for idx, sim in zip(idxs[0], sims[0])
-               if idx_to_item_id[idx] in set(candidates)}
-        scores = {mid: alpha * cf.get(mid, 0) + (1 - alpha) * sem.get(mid, 0) for mid in candidates}
+               if idx_to_item_id[idx] in candidate_set}
+        scores = {mid: alpha * cf.get(mid, 0) + (1 - alpha) * sem.get(mid, 0)
+                  for mid in candidates}
     else:
         scores = cf
 
     top_ids = sorted(scores, key=lambda m: -scores[m])[:n]
-    result = movies[movies["item_id"].isin(top_ids)][["item_id", "title", "genres_text"]].copy()
+    result = filtered[filtered["item_id"].isin(top_ids)][
+        ["item_id", "title", "genres_text", "source"]
+    ].copy()
     result["score"] = result["item_id"].map(scores).round(3)
     return result.sort_values("score", ascending=False).reset_index(drop=True)
 
@@ -130,15 +156,15 @@ def recommend(user_id, query, alpha, n, ratings, movies, R_pred, user_idx, item_
 st.set_page_config(page_title="Movie Recommender", page_icon="🎬", layout="wide")
 
 st.title("🎬 Hybrid Movie Recommender")
-st.caption("Collaborative Filtering (SVD) + Semantic Search (sentence-transformers + FAISS)")
+st.caption("Collaborative Filtering (SVD) + Semantic Search (sentence-transformers + FAISS) · Hollywood + Bollywood")
 
 ratings, movies = load_data()
 R_pred, user_idx, item_idx = build_svd(ratings)
 encoder, faiss_index, idx_to_item_id = build_semantic(movies)
 
-user_rated_map = ratings.groupby("user_id")["item_id"].apply(set).to_dict()
+n_hollywood = int((movies["source"] == "Hollywood").sum())
+n_bollywood = int((movies["source"] == "Bollywood").sum())
 
-# Sidebar controls
 with st.sidebar:
     st.header("Controls")
 
@@ -149,7 +175,7 @@ with st.sidebar:
 
     query = st.text_input(
         "Mood / genre hint (optional)",
-        placeholder="e.g. dark psychological thriller"
+        placeholder="e.g. masala action Bollywood"
     )
 
     alpha = st.slider(
@@ -160,10 +186,18 @@ with st.sidebar:
 
     n = st.slider("Number of recommendations", 5, 20, 10)
 
-    st.divider()
-    st.markdown(f"**Dataset:** MovieLens 100K  \n**Users:** {ratings['user_id'].nunique():,}  \n**Movies:** {len(movies):,}  \n**Ratings:** {len(ratings):,}")
+    catalog_filter = st.radio(
+        "Catalog", ["All", "Hollywood", "Bollywood"], horizontal=True
+    )
 
-# Main area
+    st.divider()
+    st.markdown(
+        f"**Hollywood:** {n_hollywood:,} movies  \n"
+        f"**Bollywood:** {n_bollywood:,} movies  \n"
+        f"**Ratings:** {len(ratings):,}  \n"
+        f"**Users:** {ratings['user_id'].nunique():,}"
+    )
+
 col1, col2 = st.columns([1.2, 2])
 
 with col1:
@@ -181,19 +215,23 @@ with col1:
 
 with col2:
     mode = "Hybrid" if query.strip() else "Collaborative Filtering"
-    st.subheader(f"Recommendations ({mode})")
+    st.subheader(f"Recommendations ({mode} · {catalog_filter})")
 
     recs = recommend(
-        user_id, query, alpha, n,
+        user_id, query, alpha, n, catalog_filter,
         ratings, movies, R_pred, user_idx, item_idx,
         encoder, faiss_index, idx_to_item_id
     )
 
     recs.index += 1
     st.dataframe(
-        recs[["title", "genres_text", "score"]].rename(columns={"genres_text": "genres"}),
+        recs[["title", "genres_text", "source", "score"]].rename(
+            columns={"genres_text": "genres"}
+        ),
         use_container_width=True
     )
 
     if query.strip():
-        st.info(f'Blending user taste (CF weight: {alpha}) with semantic query: *"{query}"*')
+        st.info(f'CF weight: {alpha} · Semantic query: *"{query}"*')
+    if catalog_filter == "Bollywood":
+        st.caption("Bollywood results are semantic-only (no user rating history available).")
